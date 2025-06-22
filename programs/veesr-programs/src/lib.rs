@@ -6,6 +6,12 @@ use anchor_lang::system_program;
 // For Solana Playground, you can leave it as the default or update it after deploying.
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
+// The wallet that will receive the platform fees.
+// REPLACE THIS with your actual platform fee wallet address.
+const PLATFORM_WALLET: &str = "Gf2t3iS1MTkLpn3d2hWqrM3p4Wzt5iWj2iFv2a4v5z7b"; // Example Address
+const PLATFORM_FEE_BPS: u64 = 300; // 300 basis points = 3%
+const BPS_DIVISOR: u64 = 10000;
+
 #[program]
 pub mod veesr_programs {
     use super::*;
@@ -48,6 +54,7 @@ pub mod veesr_programs {
     }
 
     /// Allows a user to donate to an active campaign.
+    /// This function now also creates a `DonationReceipt` account to track the donation.
     pub fn donate_to_campaign(ctx: Context<DonateToCampaign>, amount: u64) -> Result<()> {
         let campaign = &mut ctx.accounts.campaign;
         let clock = Clock::get()?;
@@ -56,6 +63,13 @@ pub mod veesr_programs {
         require!(amount > 0, VeesrError::InvalidDonationAmount);
         require!(campaign.status == CampaignStatus::Active, VeesrError::CampaignNotActive);
         require!(clock.unix_timestamp < campaign.deadline, VeesrError::CampaignExpired);
+
+        // Create the on-chain donation receipt
+        let receipt = &mut ctx.accounts.donation_receipt;
+        receipt.donor = ctx.accounts.donor.key();
+        receipt.campaign = campaign.key();
+        receipt.amount = amount;
+        receipt.timestamp = clock.unix_timestamp;
 
         // Perform the SOL transfer from donor to the campaign PDA
         let cpi_context = CpiContext::new(
@@ -70,7 +84,7 @@ pub mod veesr_programs {
         // Update the campaign's current amount
         campaign.current_amount = campaign.current_amount.checked_add(amount).unwrap();
 
-        msg!("Donation of {} lamports received for campaign '{}'.", amount, campaign.title);
+        msg!("Donation of {} lamports received. Receipt created.", amount);
 
         // Check if the campaign has reached its funding goal
         if campaign.current_amount >= campaign.target_amount {
@@ -82,38 +96,49 @@ pub mod veesr_programs {
     }
 
     /// Allows the campaign authority to withdraw funds and complete the campaign.
-    /// The funds are transferred to a specified executor wallet, and the campaign
-    /// account is closed, refunding the rent to the authority.
+    /// This now includes logic to send a 3% platform fee.
     pub fn withdraw_and_complete(ctx: Context<WithdrawAndComplete>) -> Result<()> {
         let campaign = &ctx.accounts.campaign;
 
         // Validation checks
         require!(campaign.status == CampaignStatus::Funded, VeesrError::CampaignNotFunded);
 
-        // 1. Transfer donated funds from the campaign PDA to the executor.
-        let amount_to_withdraw = campaign.current_amount;
-        
+        // Calculate the fee and the amount for the executor
+        let total_amount = campaign.current_amount;
+        let fee = total_amount.checked_mul(PLATFORM_FEE_BPS).unwrap().checked_div(BPS_DIVISOR).unwrap();
+        let amount_to_executor = total_amount.checked_sub(fee).unwrap();
+
+        // Get the PDA signer seeds
         let authority_key = campaign.authority.key();
         let seeds = &[&b"campaign"[..], authority_key.as_ref(), &[ctx.bumps.campaign]];
         let signer_seeds = &[&seeds[..]];
 
-        let cpi_accounts = system_program::Transfer {
-            from: campaign.to_account_info(),
-            to: ctx.accounts.executor.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.system_program.to_account_info();
-        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
-
-        system_program::transfer(cpi_context, amount_to_withdraw)?;
-
-        // 2. The account will be closed by Anchor automatically after this instruction completes,
-        //    and the rent will be refunded to the authority, because of the `close = authority`
-        //    constraint in the WithdrawAndComplete context.
+        // 1. Transfer the platform fee
+        if fee > 0 {
+            let cpi_accounts_fee = system_program::Transfer {
+                from: campaign.to_account_info(),
+                to: ctx.accounts.platform_wallet.to_account_info(),
+            };
+            let cpi_program_fee = ctx.accounts.system_program.to_account_info();
+            let cpi_context_fee = CpiContext::new_with_signer(cpi_program_fee, cpi_accounts_fee, signer_seeds);
+            system_program::transfer(cpi_context_fee, fee)?;
+        }
+        
+        // 2. Transfer the remaining funds to the executor
+        if amount_to_executor > 0 {
+            let cpi_accounts_executor = system_program::Transfer {
+                from: campaign.to_account_info(),
+                to: ctx.accounts.executor.to_account_info(),
+            };
+            let cpi_program_executor = ctx.accounts.system_program.to_account_info();
+            let cpi_context_executor = CpiContext::new_with_signer(cpi_program_executor, cpi_accounts_executor, signer_seeds);
+            system_program::transfer(cpi_context_executor, amount_to_executor)?;
+        }
 
         msg!(
-            "Withdrew {} lamports to executor. Campaign '{}' is now complete and closed.",
-            amount_to_withdraw,
-            campaign.title
+            "Withdrawal complete. Executor received: {}. Platform fee: {}.",
+            amount_to_executor,
+            fee
         );
 
         Ok(())
@@ -153,6 +178,42 @@ pub mod veesr_programs {
 
         Ok(())
     }
+
+    /// Allows a donor to claim a refund from a cancelled campaign.
+    /// This function verifies the original donation via the `DonationReceipt` account,
+    /// transfers the funds back to the donor, and closes the receipt account.
+    pub fn claim_refund(ctx: Context<ClaimRefund>) -> Result<()> {
+        let campaign = &mut ctx.accounts.campaign;
+        let receipt = &ctx.accounts.donation_receipt;
+
+        // Security checks
+        require!(campaign.status == CampaignStatus::Cancelled, VeesrError::CampaignNotCancelled);
+        require!(receipt.donor == ctx.accounts.donor.key(), VeesrError::InvalidRefundRequest);
+
+        // Transfer funds from the campaign PDA back to the donor.
+        let amount_to_refund = receipt.amount;
+        
+        let authority_key = campaign.authority;
+        let campaign_seeds = &[&b"campaign"[..], authority_key.as_ref(), &[ctx.bumps.campaign]];
+        let signer_seeds = &[&campaign_seeds[..]];
+        
+        let cpi_accounts = system_program::Transfer {
+            from: campaign.to_account_info(),
+            to: ctx.accounts.donor.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.system_program.to_account_info();
+        let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+
+        system_program::transfer(cpi_context, amount_to_refund)?;
+
+        // Decrement the campaign's total amount
+        campaign.current_amount = campaign.current_amount.checked_sub(amount_to_refund).unwrap();
+
+        msg!("Refund of {} lamports successful.", amount_to_refund);
+        
+        // The DonationReceipt account is closed automatically by the `close` constraint on the context.
+        Ok(())
+    }
 }
 
 /// The context for the `create_campaign` instruction.
@@ -183,6 +244,17 @@ pub struct DonateToCampaign<'info> {
     #[account(mut)]
     pub donor: Signer<'info>,
 
+    #[account(
+        init,
+        payer = donor,
+        space = 8 + DonationReceipt::INIT_SPACE,
+        // Seeds ensure one donation receipt per donor per campaign.
+        // This prevents a donor from creating multiple receipts for the same campaign.
+        seeds = [b"donation", campaign.key().as_ref(), donor.key().as_ref()],
+        bump
+    )]
+    pub donation_receipt: Account<'info, DonationReceipt>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -210,6 +282,13 @@ pub struct WithdrawAndComplete<'info> {
     #[account(mut)]
     pub executor: SystemAccount<'info>,
 
+    /// The wallet that will receive the platform fee.
+    #[account(
+        mut,
+        address = PLATFORM_WALLET.parse::<Pubkey>().unwrap() @ VeesrError::InvalidPlatformWallet
+    )]
+    pub platform_wallet: SystemAccount<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
@@ -227,6 +306,45 @@ pub struct CancelCampaign<'info> {
 
     #[account(mut)]
     pub authority: Signer<'info>,
+}
+
+/// The context for the `claim_refund` instruction.
+#[derive(Accounts)]
+pub struct ClaimRefund<'info> {
+    #[account(
+        mut,
+        // Re-seed the campaign PDA to verify it and access the bump
+        seeds = [b"campaign", campaign.authority.as_ref()],
+        bump
+    )]
+    pub campaign: Account<'info, Campaign>,
+
+    #[account(mut)]
+    pub donor: Signer<'info>,
+
+    #[account(
+        mut,
+        // Close the receipt account after the refund to recover its rent.
+        close = donor,
+        // Security checks to ensure the receipt matches the campaign and the donor.
+        has_one = campaign,
+        has_one = donor,
+        seeds = [b"donation", campaign.key().as_ref(), donor.key().as_ref()],
+        bump
+    )]
+    pub donation_receipt: Account<'info, DonationReceipt>,
+
+    pub system_program: Program<'info, System>,
+}
+
+/// Stores a record of a single donation.
+#[account]
+#[derive(InitSpace)]
+pub struct DonationReceipt {
+    pub donor: Pubkey,
+    pub campaign: Pubkey,
+    pub amount: u64,
+    pub timestamp: i64,
 }
 
 /// The main account that holds all the data for a campaign.
@@ -295,4 +413,10 @@ pub enum VeesrError {
     CampaignNotFunded,
     #[msg("This campaign cannot be cancelled at its current state.")]
     CannotCancelCampaign,
+    #[msg("This campaign has not been cancelled.")]
+    CampaignNotCancelled,
+    #[msg("The signer of this transaction is not the original donor.")]
+    InvalidRefundRequest,
+    #[msg("The provided platform wallet is incorrect.")]
+    InvalidPlatformWallet,
 }
